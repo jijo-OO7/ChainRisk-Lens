@@ -31,6 +31,32 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestParseRequiresCycloneDXFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    string
+		wantErr string
+	}{
+		{
+			name:    "missing format",
+			data:    `{"components":[],"dependencies":[]}`,
+			wantErr: "missing CycloneDX bomFormat",
+		},
+		{
+			name:    "other format",
+			data:    `{"bomFormat":"SPDX","components":[],"dependencies":[]}`,
+			wantErr: `unsupported bomFormat "SPDX"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := Parse([]byte(test.data)); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Parse() error = %v, want error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseRejectsMalformedJSON(t *testing.T) {
 	if _, err := Parse([]byte(`{"components":`)); err == nil {
 		t.Fatal("Parse() error = nil, want malformed JSON error")

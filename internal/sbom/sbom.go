@@ -1,6 +1,10 @@
 package sbom
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+)
 
 // SBOM contains the component and dependency data extracted from a CycloneDX document.
 type SBOM struct {
@@ -23,9 +27,19 @@ type Dependency struct {
 
 // Parse extracts components and dependency relationships from CycloneDX JSON.
 func Parse(data []byte) (SBOM, error) {
-	var document SBOM
+	var document struct {
+		BOMFormat    string        `json:"bomFormat"`
+		Components   []Component   `json:"components"`
+		Dependencies []Dependency `json:"dependencies"`
+	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return SBOM{}, err
 	}
-	return document, nil
+	if document.BOMFormat == "" {
+		return SBOM{}, errors.New("missing CycloneDX bomFormat")
+	}
+	if document.BOMFormat != "CycloneDX" {
+		return SBOM{}, fmt.Errorf("unsupported bomFormat %q: expected CycloneDX", document.BOMFormat)
+	}
+	return SBOM{Components: document.Components, Dependencies: document.Dependencies}, nil
 }

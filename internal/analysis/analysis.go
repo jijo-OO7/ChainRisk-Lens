@@ -11,16 +11,17 @@ import (
 // ErrTargetNotFound indicates that the requested target is not in the graph.
 var ErrTargetNotFound = errors.New("analysis target not found")
 
-// Impact describes a component's potential reachability from the target. It
-// does not indicate that the component is compromised.
+// Impact describes a dependent that may be affected through potential
+// propagation from the assumed-compromised target. It does not indicate that
+// the dependent is compromised.
 type Impact struct {
 	Node  dependencygraph.Node
 	Depth int
 }
 
-// Analysis contains target-centric potential impact evidence. Impacts starts
-// with Target at depth zero; remaining impacts are unique reachable dependents
-// in breadth-first order.
+// Analysis contains target-centric potential impact evidence. Target is the
+// component assumed compromised and is not included in Impacts. Impacts contains
+// unique reachable dependents in breadth-first order, beginning at depth one.
 type Analysis struct {
 	Target   dependencygraph.Node
 	Impacts  []Impact
@@ -46,7 +47,7 @@ func Analyze(graph *dependencygraph.Graph, targetBOMRef string) (Analysis, error
 
 	result := Analysis{
 		Target:  target,
-		Impacts: []Impact{{Node: target, Depth: 0}},
+		Impacts: []Impact{},
 		nodes:   map[string]dependencygraph.Node{targetBOMRef: target},
 		parents: map[string]string{targetBOMRef: ""},
 	}

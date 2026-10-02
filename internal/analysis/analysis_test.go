@@ -110,11 +110,16 @@ func TestAnalyze(t *testing.T) {
 				t.Fatalf("Analyze() error = %v", err)
 			}
 
-			wantImpacts := make([]Impact, len(test.wantRefs))
-			for i, bomRef := range test.wantRefs {
+			wantTarget := dependencygraph.Node{BOMRef: test.target, Name: test.target, Version: "1"}
+			if got.Target != wantTarget {
+				t.Errorf("Target = %#v, want %#v", got.Target, wantTarget)
+			}
+
+			wantImpacts := make([]Impact, len(test.wantRefs)-1)
+			for i, bomRef := range test.wantRefs[1:] {
 				wantImpacts[i] = Impact{
 					Node:  dependencygraph.Node{BOMRef: bomRef, Name: bomRef, Version: "1"},
-					Depth: test.wantDepths[i],
+					Depth: test.wantDepths[i+1],
 				}
 			}
 			if !reflect.DeepEqual(got.Impacts, wantImpacts) {

@@ -1,34 +1,63 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 
+	"github.com/jijo-OO7/chainrisk-lens/internal/agent"
 	"github.com/jijo-OO7/chainrisk-lens/internal/analysis"
 	"github.com/jijo-OO7/chainrisk-lens/internal/graph"
+	"github.com/jijo-OO7/chainrisk-lens/internal/investigation"
 	"github.com/jijo-OO7/chainrisk-lens/internal/sbom"
 )
 
 const (
-	formatHuman = "human"
-	formatJSON  = "json"
+	formatHuman          = "human"
+	formatJSON           = "json"
+	defaultOllamaBaseURL = "http://localhost:11434"
+	defaultOllamaModel   = "gemma4:e2b"
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "chainrisk-lens:", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	if err := execute(ctx, os.Args[1:], os.Stdout, os.Stderr, defaultInvestigatorFactory); err != nil {
+		stop()
 		os.Exit(1)
 	}
+	stop()
 }
 
 func run(args []string, output io.Writer) error {
+	return runWithInvestigatorFactory(context.Background(), args, output, defaultInvestigatorFactory)
+}
+
+type investigatorFactory func() (investigation.Investigator, error)
+
+func execute(ctx context.Context, args []string, output, errorOutput io.Writer, factory investigatorFactory) error {
+	err := runWithInvestigatorFactory(ctx, args, output, factory)
+	if err != nil {
+		fmt.Fprintln(errorOutput, "chainrisk-lens:", err)
+	}
+	return err
+}
+
+func runWithInvestigatorFactory(ctx context.Context, args []string, output io.Writer, factory investigatorFactory) error {
+	if len(args) > 0 && args[0] == "investigate" {
+		return runInvestigate(ctx, args[1:], output, factory)
+	}
+	return runAnalyze(args, output)
+}
+
+func runAnalyze(args []string, output io.Writer) error {
 	if len(args) == 0 || args[0] != "analyze" {
-		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF>")
+		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF> | investigate <sbom-file> --target <BOM-REF> --question <question>")
 	}
 
 	sbomPath, targetBOMRef, outputFormat, err := parseAnalyzeArgs(args[1:])
@@ -75,6 +104,194 @@ func run(args []string, output io.Writer) error {
 		return fmt.Errorf("write analysis report: %w", err)
 	}
 	return nil
+}
+
+func runInvestigate(ctx context.Context, args []string, output io.Writer, factory investigatorFactory) error {
+	sbomPath, targetBOMRef, question, err := parseInvestigateArgs(args)
+	if err != nil {
+		return err
+	}
+
+	data, err := os.ReadFile(sbomPath)
+	if err != nil {
+		return fmt.Errorf("read SBOM %q: %w", sbomPath, err)
+	}
+	document, err := sbom.Parse(data)
+	if err != nil {
+		return fmt.Errorf("parse SBOM %q: %w", sbomPath, err)
+	}
+
+	dependencyGraph, err := graph.New(document)
+	if err != nil {
+		return fmt.Errorf("build dependency graph: %w", err)
+	}
+	analysisResult, err := analysis.Analyze(dependencyGraph, targetBOMRef)
+	if err != nil {
+		return fmt.Errorf("analyze target %q: %w", targetBOMRef, err)
+	}
+	evidence, err := investigation.FromAnalysis(analysisResult)
+	if err != nil {
+		return fmt.Errorf("build investigation evidence: %w", err)
+	}
+	if factory == nil {
+		return errors.New("investigator factory is nil")
+	}
+	investigator, err := factory()
+	if err != nil {
+		return fmt.Errorf("create investigator: %w", err)
+	}
+	if investigator == nil {
+		return errors.New("investigator factory returned nil")
+	}
+
+	request := investigation.Request{Question: question}
+	result, err := investigator.Investigate(ctx, request, evidence)
+	if err != nil {
+		return fmt.Errorf("investigate target %q: %w", targetBOMRef, err)
+	}
+	if err := result.Validate(evidence); err != nil {
+		return fmt.Errorf("validate investigation result: %w", err)
+	}
+
+	report := formatInvestigationReport(request, evidence.Target, result)
+	if _, err := io.WriteString(output, report); err != nil {
+		return fmt.Errorf("write investigation report: %w", err)
+	}
+	return nil
+}
+
+func defaultInvestigatorFactory() (investigation.Investigator, error) {
+	model, err := agent.NewOllamaModel(agent.OllamaConfig{
+		BaseURL: defaultOllamaBaseURL,
+		Model:   defaultOllamaModel,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return agent.New(model)
+}
+
+func parseInvestigateArgs(args []string) (string, string, string, error) {
+	var sbomPath, targetBOMRef, question string
+	targetProvided := false
+	questionProvided := false
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--target":
+			if targetProvided {
+				return "", "", "", errors.New("--target may only be specified once")
+			}
+			if i+1 >= len(args) || args[i+1] == "" {
+				return "", "", "", errors.New("--target requires a BOM-REF")
+			}
+			targetBOMRef = args[i+1]
+			targetProvided = true
+			i++
+		case strings.HasPrefix(arg, "--target="):
+			if targetProvided {
+				return "", "", "", errors.New("--target may only be specified once")
+			}
+			targetBOMRef = strings.TrimPrefix(arg, "--target=")
+			if targetBOMRef == "" {
+				return "", "", "", errors.New("--target requires a BOM-REF")
+			}
+			targetProvided = true
+		case arg == "--question":
+			if questionProvided {
+				return "", "", "", errors.New("--question may only be specified once")
+			}
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", "", errors.New("--question requires a non-empty question")
+			}
+			question = args[i+1]
+			questionProvided = true
+			i++
+		case strings.HasPrefix(arg, "--question="):
+			if questionProvided {
+				return "", "", "", errors.New("--question may only be specified once")
+			}
+			question = strings.TrimPrefix(arg, "--question=")
+			if strings.TrimSpace(question) == "" {
+				return "", "", "", errors.New("--question requires a non-empty question")
+			}
+			questionProvided = true
+		case strings.HasPrefix(arg, "-"):
+			return "", "", "", fmt.Errorf("unknown option %q", arg)
+		default:
+			if sbomPath != "" {
+				return "", "", "", fmt.Errorf("unexpected argument %q", arg)
+			}
+			sbomPath = arg
+		}
+	}
+
+	if sbomPath == "" {
+		return "", "", "", errors.New("missing SBOM file path")
+	}
+	if !targetProvided {
+		return "", "", "", errors.New("missing required --target <BOM-REF>")
+	}
+	if !questionProvided {
+		return "", "", "", errors.New("missing required --question <question>")
+	}
+	return sbomPath, targetBOMRef, question, nil
+}
+
+func formatInvestigationReport(request investigation.Request, target investigation.Component, result investigation.Result) string {
+	var report strings.Builder
+	fmt.Fprintln(&report, "Investigation")
+	fmt.Fprintf(&report, "Question: %s\n\n", request.Question)
+	fmt.Fprintln(&report, "Compromised Target:")
+	fmt.Fprintf(&report, "  %s %s\n\n", target.BOMRef, investigationComponentLabel(target))
+	fmt.Fprintln(&report, "Summary:")
+	fmt.Fprintf(&report, "  %s\n\n", result.Summary)
+
+	fmt.Fprintln(&report, "Findings:")
+	if len(result.Findings) == 0 {
+		fmt.Fprintln(&report, "  None.")
+	} else {
+		for index, finding := range result.Findings {
+			fmt.Fprintf(&report, "  %d. %s\n", index+1, finding.Statement)
+			var bomRefs []string
+			for _, evidenceRef := range finding.Evidence {
+				bomRefs = append(bomRefs, evidenceRef.BOMRefs...)
+			}
+			fmt.Fprintf(&report, "     Evidence: %s\n", strings.Join(bomRefs, ", "))
+		}
+	}
+
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "Uncertainty:")
+	writeReportList(&report, result.Uncertainty)
+	fmt.Fprintln(&report)
+	fmt.Fprintln(&report, "Next Steps:")
+	writeReportList(&report, result.NextSteps)
+	return report.String()
+}
+
+func writeReportList(report *strings.Builder, items []string) {
+	if len(items) == 0 {
+		fmt.Fprintln(report, "  None.")
+		return
+	}
+	for _, item := range items {
+		fmt.Fprintf(report, "  - %s\n", item)
+	}
+}
+
+func investigationComponentLabel(component investigation.Component) string {
+	switch {
+	case component.Name == "" && component.Version == "":
+		return component.BOMRef
+	case component.Name == "":
+		return component.Version
+	case component.Version == "":
+		return component.Name
+	default:
+		return component.Name + "@" + component.Version
+	}
 }
 
 func parseAnalyzeArgs(args []string) (string, string, string, error) {

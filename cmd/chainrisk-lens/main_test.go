@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -11,8 +12,25 @@ import (
 	"testing"
 
 	"github.com/jijo-OO7/chainrisk-lens/internal/analysis"
+	"github.com/jijo-OO7/chainrisk-lens/internal/graph"
+	"github.com/jijo-OO7/chainrisk-lens/internal/investigation"
 	"github.com/jijo-OO7/chainrisk-lens/internal/sbom"
 )
+
+type fakeInvestigator struct {
+	request  investigation.Request
+	evidence investigation.Evidence
+	result   investigation.Result
+	err      error
+	calls    int
+}
+
+func (investigator *fakeInvestigator) Investigate(_ context.Context, request investigation.Request, evidence investigation.Evidence) (investigation.Result, error) {
+	investigator.calls++
+	investigator.request = request
+	investigator.evidence = evidence
+	return investigator.result, investigator.err
+}
 
 func TestRunSuccessfulAnalysis(t *testing.T) {
 	sbomPath := writeSBOM(t, sbom.SBOM{
@@ -322,6 +340,204 @@ func TestRunDeterministicOutput(t *testing.T) {
 	}
 	if firstJSON.String() != secondJSON.String() {
 		t.Fatalf("equivalent SBOMs produced different JSON output:\n--- first ---\n%s\n--- second ---\n%s", firstJSON.String(), secondJSON.String())
+	}
+}
+
+func TestRunInvestigateSuccessfulPipelineAndOutput(t *testing.T) {
+	const question = "  Explain the potential impact of this compromised dependency.  "
+	const targetBOMRef = "library@2.3.4"
+	sbomPath := fixtureSBOMPath(t)
+	wantEvidence := evidenceFromFixture(t, targetBOMRef)
+	wantResult := fakeInvestigationResult()
+	fake := &fakeInvestigator{result: wantResult}
+	factoryCalls := 0
+	factory := func() (investigation.Investigator, error) {
+		factoryCalls++
+		return fake, nil
+	}
+
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", sbomPath, "--target", targetBOMRef, "--question", question,
+	}, &output, factory)
+	if err != nil {
+		t.Fatalf("investigate command error = %v", err)
+	}
+	if factoryCalls != 1 || fake.calls != 1 {
+		t.Fatalf("factory/investigator calls = %d/%d, want 1/1", factoryCalls, fake.calls)
+	}
+	if fake.request.Question != question {
+		t.Errorf("investigator question = %q, want unchanged %q", fake.request.Question, question)
+	}
+	if !reflect.DeepEqual(fake.evidence, wantEvidence) {
+		t.Fatalf("investigator evidence = %#v, want FromAnalysis() evidence %#v", fake.evidence, wantEvidence)
+	}
+	if fake.evidence.Target.BOMRef != targetBOMRef || len(fake.evidence.Impacts) != 1 {
+		t.Fatalf("target/impacts = %#v/%#v, want separate target and one dependent", fake.evidence.Target, fake.evidence.Impacts)
+	}
+	if impact := fake.evidence.Impacts[0]; impact.BOMRef == targetBOMRef || impact.Depth != 1 || !reflect.DeepEqual(impact.Path, []string{targetBOMRef, "app@1.0.0"}) {
+		t.Errorf("impact = %#v, want app@1.0.0 at depth 1 with the canonical path", impact)
+	}
+
+	for _, want := range []string{
+		"Question: " + question,
+		"Compromised Target:\n  library@2.3.4 library@2.3.4",
+		"Summary:\n  Potential propagation reaches the supplied app.",
+		"1. The app is potentially affected through the supplied dependency path.",
+		"Evidence: library@2.3.4, app@1.0.0",
+		"- The supplied evidence does not establish whether the app is compromised.",
+		"- Verify the app against trusted deployment records.",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("investigation output does not contain %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestRunInvestigateMissingTargetDoesNotCallInvestigator(t *testing.T) {
+	fake := &fakeInvestigator{result: fakeInvestigationResult()}
+	factoryCalls := 0
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", fixtureSBOMPath(t), "--target", "missing-ref", "--question", "Explain impact.",
+	}, &output, func() (investigation.Investigator, error) {
+		factoryCalls++
+		return fake, nil
+	})
+	if !errors.Is(err, analysis.ErrTargetNotFound) {
+		t.Fatalf("investigate command error = %v, want ErrTargetNotFound", err)
+	}
+	if factoryCalls != 0 || fake.calls != 0 {
+		t.Errorf("factory/investigator calls = %d/%d, want 0/0", factoryCalls, fake.calls)
+	}
+	if output.Len() != 0 {
+		t.Errorf("command wrote output on missing target: %q", output.String())
+	}
+}
+
+func TestRunInvestigateMalformedSBOMDoesNotCallInvestigator(t *testing.T) {
+	sbomPath := filepath.Join(t.TempDir(), "malformed.json")
+	if err := os.WriteFile(sbomPath, []byte(`{"components":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeInvestigator{result: fakeInvestigationResult()}
+	factoryCalls := 0
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", sbomPath, "--target", "library@2.3.4", "--question", "Explain impact.",
+	}, &output, func() (investigation.Investigator, error) {
+		factoryCalls++
+		return fake, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "parse SBOM") {
+		t.Fatalf("investigate command error = %v, want malformed SBOM error", err)
+	}
+	if factoryCalls != 0 || fake.calls != 0 {
+		t.Errorf("factory/investigator calls = %d/%d, want 0/0", factoryCalls, fake.calls)
+	}
+	if output.Len() != 0 {
+		t.Errorf("command wrote output on malformed SBOM: %q", output.String())
+	}
+}
+
+func TestRunInvestigateRejectsInvalidInvestigatorResult(t *testing.T) {
+	fake := &fakeInvestigator{result: investigation.Result{
+		Summary:     "Unsupported result",
+		Findings:    []investigation.Finding{{Statement: "Unsupported claim", Evidence: []investigation.EvidenceRef{{BOMRefs: []string{"unknown-ref"}}}}},
+		Uncertainty: []string{},
+		NextSteps:   []string{},
+	}}
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", fixtureSBOMPath(t), "--target", "library@2.3.4", "--question", "Explain impact.",
+	}, &output, func() (investigation.Investigator, error) { return fake, nil })
+	if err == nil || !strings.Contains(err.Error(), "not present in supplied evidence") {
+		t.Fatalf("investigate command error = %v, want result validation error", err)
+	}
+	if fake.calls != 1 {
+		t.Errorf("investigator calls = %d, want 1", fake.calls)
+	}
+	if output.Len() != 0 {
+		t.Errorf("command printed invalid result: %q", output.String())
+	}
+}
+
+func TestRunInvestigateReportsInvestigatorErrorToStderr(t *testing.T) {
+	fake := &fakeInvestigator{err: errors.New("controlled investigator failure")}
+	var stdout, stderr bytes.Buffer
+	err := execute(context.Background(), []string{
+		"investigate", fixtureSBOMPath(t), "--target", "library@2.3.4", "--question", "Explain impact.",
+	}, &stdout, &stderr, func() (investigation.Investigator, error) { return fake, nil })
+	if err == nil || !strings.Contains(err.Error(), "controlled investigator failure") {
+		t.Fatalf("execute() error = %v, want investigator error", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("command wrote success output after investigator error: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "controlled investigator failure") {
+		t.Errorf("stderr = %q, want investigator error", stderr.String())
+	}
+	if fake.calls != 1 {
+		t.Errorf("investigator calls = %d, want 1", fake.calls)
+	}
+}
+
+func TestRunInvestigateOutputIsDeterministic(t *testing.T) {
+	sbomPath := fixtureSBOMPath(t)
+	args := []string{"investigate", sbomPath, "--target", "library@2.3.4", "--question", "Explain impact."}
+	var outputs [2]bytes.Buffer
+	for i := range outputs {
+		fake := &fakeInvestigator{result: fakeInvestigationResult()}
+		if err := runWithInvestigatorFactory(context.Background(), args, &outputs[i], func() (investigation.Investigator, error) {
+			return fake, nil
+		}); err != nil {
+			t.Fatalf("run %d error = %v", i+1, err)
+		}
+	}
+	if outputs[0].String() != outputs[1].String() {
+		t.Fatalf("same input/result produced different reports:\n--- first ---\n%s\n--- second ---\n%s", outputs[0].String(), outputs[1].String())
+	}
+}
+
+func fixtureSBOMPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join("..", "..", "testdata", "minimal-cyclonedx.json")
+}
+
+func evidenceFromFixture(t *testing.T, targetBOMRef string) investigation.Evidence {
+	t.Helper()
+	data, err := os.ReadFile(fixtureSBOMPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := sbom.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencyGraph, err := graph.New(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := analysis.Analyze(dependencyGraph, targetBOMRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := investigation.FromAnalysis(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evidence
+}
+
+func fakeInvestigationResult() investigation.Result {
+	return investigation.Result{
+		Summary: "Potential propagation reaches the supplied app.",
+		Findings: []investigation.Finding{{
+			Statement: "The app is potentially affected through the supplied dependency path.",
+			Evidence:  []investigation.EvidenceRef{{BOMRefs: []string{"library@2.3.4", "app@1.0.0"}}},
+		}},
+		Uncertainty: []string{"The supplied evidence does not establish whether the app is compromised."},
+		NextSteps:   []string{"Verify the app against trusted deployment records."},
 	}
 }
 

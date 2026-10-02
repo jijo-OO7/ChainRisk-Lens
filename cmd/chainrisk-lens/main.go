@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,11 @@ import (
 	"github.com/jijo-OO7/chainrisk-lens/internal/analysis"
 	"github.com/jijo-OO7/chainrisk-lens/internal/graph"
 	"github.com/jijo-OO7/chainrisk-lens/internal/sbom"
+)
+
+const (
+	formatHuman = "human"
+	formatJSON  = "json"
 )
 
 func main() {
@@ -25,7 +31,7 @@ func run(args []string, output io.Writer) error {
 		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF>")
 	}
 
-	sbomPath, targetBOMRef, err := parseAnalyzeArgs(args[1:])
+	sbomPath, targetBOMRef, outputFormat, err := parseAnalyzeArgs(args[1:])
 	if err != nil {
 		return err
 	}
@@ -50,6 +56,17 @@ func run(args []string, output io.Writer) error {
 		return fmt.Errorf("analyze target %q: %w", targetBOMRef, err)
 	}
 
+	if outputFormat == formatJSON {
+		report, err := formatJSONReport(result)
+		if err != nil {
+			return err
+		}
+		if err := json.NewEncoder(output).Encode(report); err != nil {
+			return fmt.Errorf("write analysis report: %w", err)
+		}
+		return nil
+	}
+
 	report, err := formatReport(result)
 	if err != nil {
 		return err
@@ -60,50 +77,128 @@ func run(args []string, output io.Writer) error {
 	return nil
 }
 
-func parseAnalyzeArgs(args []string) (string, string, error) {
+func parseAnalyzeArgs(args []string) (string, string, string, error) {
 	var sbomPath string
 	var targetBOMRef string
+	outputFormat := formatHuman
 	targetProvided := false
+	formatProvided := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--target":
 			if targetProvided {
-				return "", "", errors.New("--target may only be specified once")
+				return "", "", "", errors.New("--target may only be specified once")
 			}
 			if i+1 >= len(args) || args[i+1] == "" {
-				return "", "", errors.New("--target requires a BOM-REF")
+				return "", "", "", errors.New("--target requires a BOM-REF")
 			}
 			targetBOMRef = args[i+1]
 			targetProvided = true
 			i++
 		case strings.HasPrefix(arg, "--target="):
 			if targetProvided {
-				return "", "", errors.New("--target may only be specified once")
+				return "", "", "", errors.New("--target may only be specified once")
 			}
 			targetBOMRef = strings.TrimPrefix(arg, "--target=")
 			if targetBOMRef == "" {
-				return "", "", errors.New("--target requires a BOM-REF")
+				return "", "", "", errors.New("--target requires a BOM-REF")
 			}
 			targetProvided = true
+		case arg == "--format":
+			if formatProvided {
+				return "", "", "", errors.New("--format may only be specified once")
+			}
+			if i+1 >= len(args) || args[i+1] == "" {
+				return "", "", "", errors.New("--format requires a value: human or json")
+			}
+			outputFormat = args[i+1]
+			formatProvided = true
+			i++
+		case strings.HasPrefix(arg, "--format="):
+			if formatProvided {
+				return "", "", "", errors.New("--format may only be specified once")
+			}
+			outputFormat = strings.TrimPrefix(arg, "--format=")
+			if outputFormat == "" {
+				return "", "", "", errors.New("--format requires a value: human or json")
+			}
+			formatProvided = true
 		case strings.HasPrefix(arg, "-"):
-			return "", "", fmt.Errorf("unknown option %q", arg)
+			return "", "", "", fmt.Errorf("unknown option %q", arg)
 		default:
 			if sbomPath != "" {
-				return "", "", fmt.Errorf("unexpected argument %q", arg)
+				return "", "", "", fmt.Errorf("unexpected argument %q", arg)
 			}
 			sbomPath = arg
 		}
 	}
 
 	if sbomPath == "" {
-		return "", "", errors.New("missing SBOM file path")
+		return "", "", "", errors.New("missing SBOM file path")
 	}
 	if !targetProvided {
-		return "", "", errors.New("missing required --target <BOM-REF>")
+		return "", "", "", errors.New("missing required --target <BOM-REF>")
 	}
-	return sbomPath, targetBOMRef, nil
+	if outputFormat != formatHuman && outputFormat != formatJSON {
+		return "", "", "", fmt.Errorf("unsupported output format %q (want human or json)", outputFormat)
+	}
+	return sbomPath, targetBOMRef, outputFormat, nil
+}
+
+type jsonReport struct {
+	Target   jsonComponent `json:"target"`
+	Impacts  []jsonImpact  `json:"impacts"`
+	MaxDepth int           `json:"maxDepth"`
+	Cycle    bool          `json:"cycle"`
+}
+
+type jsonComponent struct {
+	BOMRef  string `json:"bomRef"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type jsonImpact struct {
+	BOMRef  string   `json:"bomRef"`
+	Name    string   `json:"name"`
+	Version string   `json:"version"`
+	Depth   int      `json:"depth"`
+	Path    []string `json:"path"`
+}
+
+func formatJSONReport(result analysis.Analysis) (jsonReport, error) {
+	report := jsonReport{
+		Target: jsonComponent{
+			BOMRef:  result.Target.BOMRef,
+			Name:    result.Target.Name,
+			Version: result.Target.Version,
+		},
+		Impacts:  make([]jsonImpact, 0, len(result.Impacts)),
+		MaxDepth: result.MaxDepth,
+		Cycle:    result.Cycle,
+	}
+
+	for _, impact := range orderedImpacts(result.Impacts) {
+		path, exists := result.PathTo(impact.Node.BOMRef)
+		if !exists {
+			return jsonReport{}, fmt.Errorf("analysis path is unavailable for dependent %q", impact.Node.BOMRef)
+		}
+		pathBOMRefs := make([]string, len(path))
+		for i, node := range path {
+			pathBOMRefs[i] = node.BOMRef
+		}
+
+		report.Impacts = append(report.Impacts, jsonImpact{
+			BOMRef:  impact.Node.BOMRef,
+			Name:    impact.Node.Name,
+			Version: impact.Node.Version,
+			Depth:   impact.Depth,
+			Path:    pathBOMRefs,
+		})
+	}
+	return report, nil
 }
 
 func formatReport(result analysis.Analysis) (string, error) {
@@ -133,13 +228,7 @@ func formatReport(result analysis.Analysis) (string, error) {
 	fmt.Fprintln(&report, "Propagation")
 	fmt.Fprintln(&report)
 
-	impacts := append([]analysis.Impact(nil), result.Impacts...)
-	sort.Slice(impacts, func(i, j int) bool {
-		if impacts[i].Depth != impacts[j].Depth {
-			return impacts[i].Depth < impacts[j].Depth
-		}
-		return impacts[i].Node.BOMRef < impacts[j].Node.BOMRef
-	})
+	impacts := orderedImpacts(result.Impacts)
 
 	currentDepth := 0
 	for _, impact := range impacts {
@@ -170,6 +259,17 @@ func formatReport(result analysis.Analysis) (string, error) {
 	}
 
 	return report.String(), nil
+}
+
+func orderedImpacts(impacts []analysis.Impact) []analysis.Impact {
+	ordered := append([]analysis.Impact(nil), impacts...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Depth != ordered[j].Depth {
+			return ordered[i].Depth < ordered[j].Depth
+		}
+		return ordered[i].Node.BOMRef < ordered[j].Node.BOMRef
+	})
+	return ordered
 }
 
 func componentLabel(node graph.Node) string {

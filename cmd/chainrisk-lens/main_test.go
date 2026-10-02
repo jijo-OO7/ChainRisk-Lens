@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -41,6 +42,173 @@ func TestRunSuccessfulAnalysis(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "Depth 0") {
 		t.Errorf("report presents the target as an impact:\n%s", output.String())
+	}
+}
+
+func TestRunExplicitHumanFormatMatchesDefault(t *testing.T) {
+	sbomPath := writeSBOM(t, sbom.SBOM{
+		Components: []sbom.Component{{BOMRef: "target", Name: "target", Version: "1"}},
+	})
+
+	var defaultOutput, explicitOutput bytes.Buffer
+	if err := run([]string{"analyze", sbomPath, "--target", "target"}, &defaultOutput); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"analyze", sbomPath, "--target", "target", "--format", "human"}, &explicitOutput); err != nil {
+		t.Fatal(err)
+	}
+	if defaultOutput.String() != explicitOutput.String() {
+		t.Fatalf("explicit human output differs from default:\n--- default ---\n%s\n--- explicit ---\n%s", defaultOutput.String(), explicitOutput.String())
+	}
+}
+
+func TestRunJSONFormat(t *testing.T) {
+	sbomPath := writeSBOM(t, sbom.SBOM{
+		Components: []sbom.Component{
+			{BOMRef: "target-ref", Name: "library", Version: "1.0.0"},
+			{BOMRef: "service-ref", Name: "service", Version: "2.1.0"},
+			{BOMRef: "worker-ref", Name: "worker", Version: "3.0.0"},
+		},
+		Dependencies: []sbom.Dependency{
+			{Ref: "service-ref", DependsOn: []string{"target-ref"}},
+			{Ref: "worker-ref", DependsOn: []string{"service-ref"}},
+		},
+	})
+
+	var separatedOutput, equalsOutput bytes.Buffer
+	if err := run([]string{"analyze", sbomPath, "--target", "target-ref", "--format", "json"}, &separatedOutput); err != nil {
+		t.Fatalf("run(--format json) error = %v", err)
+	}
+	if err := run([]string{"analyze", sbomPath, "--target", "target-ref", "--format=json"}, &equalsOutput); err != nil {
+		t.Fatalf("run(--format=json) error = %v", err)
+	}
+	if separatedOutput.String() != equalsOutput.String() {
+		t.Fatalf("equivalent JSON format arguments produced different output:\n%s\n%s", separatedOutput.String(), equalsOutput.String())
+	}
+	if strings.HasPrefix(separatedOutput.String(), "ChainRisk Lens") {
+		t.Fatalf("JSON output contains a human-readable heading: %s", separatedOutput.String())
+	}
+
+	var report jsonReport
+	if err := json.Unmarshal(separatedOutput.Bytes(), &report); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, separatedOutput.String())
+	}
+	if report.Target != (jsonComponent{BOMRef: "target-ref", Name: "library", Version: "1.0.0"}) {
+		t.Errorf("target = %#v, want target component serialized separately", report.Target)
+	}
+	wantImpacts := []jsonImpact{
+		{
+			BOMRef: "service-ref", Name: "service", Version: "2.1.0", Depth: 1,
+			Path: []string{"target-ref", "service-ref"},
+		},
+		{
+			BOMRef: "worker-ref", Name: "worker", Version: "3.0.0", Depth: 2,
+			Path: []string{"target-ref", "service-ref", "worker-ref"},
+		},
+	}
+	if !reflect.DeepEqual(report.Impacts, wantImpacts) {
+		t.Errorf("impacts = %#v, want %#v", report.Impacts, wantImpacts)
+	}
+	for _, impact := range report.Impacts {
+		if impact.BOMRef == report.Target.BOMRef {
+			t.Errorf("target %q appears in impacts", report.Target.BOMRef)
+		}
+	}
+	if report.MaxDepth != 2 || report.Cycle {
+		t.Errorf("maxDepth/cycle = %d/%t, want 2/false", report.MaxDepth, report.Cycle)
+	}
+}
+
+func TestRunJSONIsolatedTargetAndCycle(t *testing.T) {
+	tests := []struct {
+		name        string
+		document    sbom.SBOM
+		target      string
+		wantImpacts []jsonImpact
+		wantMax     int
+		wantCycle   bool
+	}{
+		{
+			name: "isolated target",
+			document: sbom.SBOM{
+				Components: []sbom.Component{{BOMRef: "target", Name: "target", Version: "1"}},
+			},
+			target:      "target",
+			wantImpacts: []jsonImpact{},
+		},
+		{
+			name: "reachable cycle",
+			document: sbom.SBOM{
+				Components: []sbom.Component{
+					{BOMRef: "target", Name: "target", Version: "1"},
+					{BOMRef: "dependent", Name: "dependent", Version: "2"},
+				},
+				Dependencies: []sbom.Dependency{
+					{Ref: "target", DependsOn: []string{"dependent"}},
+					{Ref: "dependent", DependsOn: []string{"target"}},
+				},
+			},
+			target: "target",
+			wantImpacts: []jsonImpact{{
+				BOMRef: "dependent", Name: "dependent", Version: "2", Depth: 1,
+				Path: []string{"target", "dependent"},
+			}},
+			wantMax:   1,
+			wantCycle: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sbomPath := writeSBOM(t, test.document)
+			var output bytes.Buffer
+			if err := run([]string{"analyze", sbomPath, "--target", test.target, "--format=json"}, &output); err != nil {
+				t.Fatalf("run() error = %v", err)
+			}
+
+			var report jsonReport
+			if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+				t.Fatalf("output is not valid JSON: %v", err)
+			}
+			if !reflect.DeepEqual(report.Impacts, test.wantImpacts) {
+				t.Errorf("impacts = %#v, want %#v", report.Impacts, test.wantImpacts)
+			}
+			if report.MaxDepth != test.wantMax || report.Cycle != test.wantCycle {
+				t.Errorf("maxDepth/cycle = %d/%t, want %d/%t", report.MaxDepth, report.Cycle, test.wantMax, test.wantCycle)
+			}
+		})
+	}
+}
+
+func TestRunFormatArgumentErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unsupported format",
+			args:    []string{"analyze", "unused.json", "--target", "target", "--format", "yaml"},
+			wantErr: "unsupported output format",
+		},
+		{
+			name:    "duplicate format",
+			args:    []string{"analyze", "unused.json", "--target", "target", "--format", "json", "--format=human"},
+			wantErr: "--format may only be specified once",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			err := run(test.args, &output)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("run() error = %v, want error containing %q", err, test.wantErr)
+			}
+			if output.Len() != 0 {
+				t.Errorf("run() wrote output before failing: %q", output.String())
+			}
+		})
 	}
 }
 
@@ -143,6 +311,17 @@ func TestRunDeterministicOutput(t *testing.T) {
 	}
 	if !strings.Contains(firstOutput.String(), "Path: target@1 -> a@1 -> leaf@1") {
 		t.Errorf("report did not use the canonical shortest path:\n%s", firstOutput.String())
+	}
+
+	var firstJSON, secondJSON bytes.Buffer
+	if err := run([]string{"analyze", firstPath, "--target", "target", "--format=json"}, &firstJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"analyze", secondPath, "--target", "target", "--format=json"}, &secondJSON); err != nil {
+		t.Fatal(err)
+	}
+	if firstJSON.String() != secondJSON.String() {
+		t.Fatalf("equivalent SBOMs produced different JSON output:\n--- first ---\n%s\n--- second ---\n%s", firstJSON.String(), secondJSON.String())
 	}
 }
 

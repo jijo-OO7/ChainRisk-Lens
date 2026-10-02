@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jijo-OO7/chainrisk-lens/internal/agent"
 	"github.com/jijo-OO7/chainrisk-lens/internal/analysis"
 	"github.com/jijo-OO7/chainrisk-lens/internal/graph"
 	"github.com/jijo-OO7/chainrisk-lens/internal/investigation"
@@ -60,6 +61,26 @@ func TestRunSuccessfulAnalysis(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "Depth 0") {
 		t.Errorf("report presents the target as an impact:\n%s", output.String())
+	}
+}
+
+func TestAnalyzeDoesNotInstantiateInvestigator(t *testing.T) {
+	sbomPath := writeSBOM(t, sbom.SBOM{
+		Components: []sbom.Component{{BOMRef: "target", Name: "target", Version: "1"}},
+	})
+	factoryCalls := 0
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"analyze", sbomPath, "--target", "target",
+	}, &output, func(agent.OllamaConfig) (investigation.Investigator, error) {
+		factoryCalls++
+		return nil, errors.New("investigator must not be constructed for analyze")
+	})
+	if err != nil {
+		t.Fatalf("analyze command error = %v", err)
+	}
+	if factoryCalls != 0 {
+		t.Errorf("investigator factory called %d times, want 0", factoryCalls)
 	}
 }
 
@@ -351,8 +372,10 @@ func TestRunInvestigateSuccessfulPipelineAndOutput(t *testing.T) {
 	wantResult := fakeInvestigationResult()
 	fake := &fakeInvestigator{result: wantResult}
 	factoryCalls := 0
-	factory := func() (investigation.Investigator, error) {
+	var gotConfig agent.OllamaConfig
+	factory := func(config agent.OllamaConfig) (investigation.Investigator, error) {
 		factoryCalls++
+		gotConfig = config
 		return fake, nil
 	}
 
@@ -365,6 +388,9 @@ func TestRunInvestigateSuccessfulPipelineAndOutput(t *testing.T) {
 	}
 	if factoryCalls != 1 || fake.calls != 1 {
 		t.Fatalf("factory/investigator calls = %d/%d, want 1/1", factoryCalls, fake.calls)
+	}
+	if gotConfig.BaseURL != defaultOllamaBaseURL || gotConfig.Model != defaultOllamaModel {
+		t.Errorf("default Ollama config = %#v, want base URL %q and model %q", gotConfig, defaultOllamaBaseURL, defaultOllamaModel)
 	}
 	if fake.request.Question != question {
 		t.Errorf("investigator question = %q, want unchanged %q", fake.request.Question, question)
@@ -394,13 +420,93 @@ func TestRunInvestigateSuccessfulPipelineAndOutput(t *testing.T) {
 	}
 }
 
+func TestRunInvestigateRuntimeFlagsOverrideDefaults(t *testing.T) {
+	fake := &fakeInvestigator{result: fakeInvestigationResult()}
+	var gotConfig agent.OllamaConfig
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", fixtureSBOMPath(t),
+		"--target", "library@2.3.4",
+		"--question", "Explain impact.",
+		"--model", "custom-gemma:latest",
+		"--ollama-url=http://127.0.0.1:11435",
+	}, &output, func(config agent.OllamaConfig) (investigation.Investigator, error) {
+		gotConfig = config
+		return fake, nil
+	})
+	if err != nil {
+		t.Fatalf("investigate command error = %v", err)
+	}
+	if gotConfig.Model != "custom-gemma:latest" || gotConfig.BaseURL != "http://127.0.0.1:11435" {
+		t.Errorf("Ollama config = %#v, want overridden model and URL", gotConfig)
+	}
+	if fake.calls != 1 {
+		t.Errorf("investigator calls = %d, want 1", fake.calls)
+	}
+}
+
+func TestParseInvestigateArgsRejectsInvalidRuntimeFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "empty model",
+			args:    []string{"sbom.json", "--target", "target", "--question", "Explain.", "--model="},
+			wantErr: "--model requires a non-empty model name",
+		},
+		{
+			name:    "empty Ollama URL",
+			args:    []string{"sbom.json", "--target", "target", "--question", "Explain.", "--ollama-url="},
+			wantErr: "--ollama-url requires a non-empty URL",
+		},
+		{
+			name:    "duplicate model",
+			args:    []string{"sbom.json", "--target", "target", "--question", "Explain.", "--model", "one", "--model", "two"},
+			wantErr: "--model may only be specified once",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseInvestigateArgs(test.args); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("parseInvestigateArgs() error = %v, want error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunInvestigateAcceptsNonLoopbackOllamaURL(t *testing.T) {
+	fake := &fakeInvestigator{result: fakeInvestigationResult()}
+	var gotConfig agent.OllamaConfig
+	var output bytes.Buffer
+	err := runWithInvestigatorFactory(context.Background(), []string{
+		"investigate", fixtureSBOMPath(t),
+		"--target", "library@2.3.4",
+		"--question", "Explain impact.",
+		"--ollama-url", "http://example.com:11434",
+	}, &output, func(config agent.OllamaConfig) (investigation.Investigator, error) {
+		gotConfig = config
+		return fake, nil
+	})
+	if err != nil {
+		t.Fatalf("investigate command error = %v", err)
+	}
+	if gotConfig.BaseURL != "http://example.com:11434" {
+		t.Errorf("Ollama base URL = %q, want non-loopback URL", gotConfig.BaseURL)
+	}
+	if fake.calls != 1 || output.Len() == 0 {
+		t.Errorf("investigator calls/output = %d/%q, want successful investigation", fake.calls, output.String())
+	}
+}
+
 func TestRunInvestigateMissingTargetDoesNotCallInvestigator(t *testing.T) {
 	fake := &fakeInvestigator{result: fakeInvestigationResult()}
 	factoryCalls := 0
 	var output bytes.Buffer
 	err := runWithInvestigatorFactory(context.Background(), []string{
 		"investigate", fixtureSBOMPath(t), "--target", "missing-ref", "--question", "Explain impact.",
-	}, &output, func() (investigation.Investigator, error) {
+	}, &output, func(agent.OllamaConfig) (investigation.Investigator, error) {
 		factoryCalls++
 		return fake, nil
 	})
@@ -425,7 +531,7 @@ func TestRunInvestigateMalformedSBOMDoesNotCallInvestigator(t *testing.T) {
 	var output bytes.Buffer
 	err := runWithInvestigatorFactory(context.Background(), []string{
 		"investigate", sbomPath, "--target", "library@2.3.4", "--question", "Explain impact.",
-	}, &output, func() (investigation.Investigator, error) {
+	}, &output, func(agent.OllamaConfig) (investigation.Investigator, error) {
 		factoryCalls++
 		return fake, nil
 	})
@@ -450,7 +556,7 @@ func TestRunInvestigateRejectsInvalidInvestigatorResult(t *testing.T) {
 	var output bytes.Buffer
 	err := runWithInvestigatorFactory(context.Background(), []string{
 		"investigate", fixtureSBOMPath(t), "--target", "library@2.3.4", "--question", "Explain impact.",
-	}, &output, func() (investigation.Investigator, error) { return fake, nil })
+	}, &output, func(agent.OllamaConfig) (investigation.Investigator, error) { return fake, nil })
 	if err == nil || !strings.Contains(err.Error(), "not present in supplied evidence") {
 		t.Fatalf("investigate command error = %v, want result validation error", err)
 	}
@@ -467,7 +573,7 @@ func TestRunInvestigateReportsInvestigatorErrorToStderr(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := execute(context.Background(), []string{
 		"investigate", fixtureSBOMPath(t), "--target", "library@2.3.4", "--question", "Explain impact.",
-	}, &stdout, &stderr, func() (investigation.Investigator, error) { return fake, nil })
+	}, &stdout, &stderr, func(agent.OllamaConfig) (investigation.Investigator, error) { return fake, nil })
 	if err == nil || !strings.Contains(err.Error(), "controlled investigator failure") {
 		t.Fatalf("execute() error = %v, want investigator error", err)
 	}
@@ -488,7 +594,7 @@ func TestRunInvestigateOutputIsDeterministic(t *testing.T) {
 	var outputs [2]bytes.Buffer
 	for i := range outputs {
 		fake := &fakeInvestigator{result: fakeInvestigationResult()}
-		if err := runWithInvestigatorFactory(context.Background(), args, &outputs[i], func() (investigation.Investigator, error) {
+		if err := runWithInvestigatorFactory(context.Background(), args, &outputs[i], func(agent.OllamaConfig) (investigation.Investigator, error) {
 			return fake, nil
 		}); err != nil {
 			t.Fatalf("run %d error = %v", i+1, err)

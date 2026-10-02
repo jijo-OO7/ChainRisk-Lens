@@ -191,13 +191,22 @@ func TestOllamaSchemaIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestNewOllamaModelRejectsNonLoopbackEndpoint(t *testing.T) {
-	for _, baseURL := range []string{"http://example.com:11434", "https://localhost:11434"} {
-		t.Run(baseURL, func(t *testing.T) {
-			if _, err := NewOllamaModel(OllamaConfig{BaseURL: baseURL, Model: "gemma4:e2b"}); err == nil {
-				t.Fatalf("NewOllamaModel(%q) error = nil, want non-local endpoint rejection", baseURL)
-			}
-		})
+func TestNewOllamaModelAcceptsNonLoopbackEndpoint(t *testing.T) {
+	model, err := NewOllamaModel(OllamaConfig{
+		BaseURL: "https://ollama.example.com:11434",
+		Model:   "gemma4:e2b",
+	})
+	if err != nil {
+		t.Fatalf("NewOllamaModel() error = %v", err)
+	}
+	if model.endpoint != "https://ollama.example.com:11434/api/chat" {
+		t.Errorf("endpoint = %q, want HTTPS Ollama chat endpoint", model.endpoint)
+	}
+}
+
+func TestNewOllamaModelRejectsMalformedBaseURL(t *testing.T) {
+	if _, err := NewOllamaModel(OllamaConfig{BaseURL: "http://[::1", Model: "gemma4:e2b"}); err == nil {
+		t.Fatal("NewOllamaModel() error = nil, want malformed URL error")
 	}
 }
 

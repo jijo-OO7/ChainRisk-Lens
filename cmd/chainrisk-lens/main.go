@@ -38,7 +38,7 @@ func run(args []string, output io.Writer) error {
 	return runWithInvestigatorFactory(context.Background(), args, output, defaultInvestigatorFactory)
 }
 
-type investigatorFactory func() (investigation.Investigator, error)
+type investigatorFactory func(agent.OllamaConfig) (investigation.Investigator, error)
 
 func execute(ctx context.Context, args []string, output, errorOutput io.Writer, factory investigatorFactory) error {
 	err := runWithInvestigatorFactory(ctx, args, output, factory)
@@ -57,7 +57,7 @@ func runWithInvestigatorFactory(ctx context.Context, args []string, output io.Wr
 
 func runAnalyze(args []string, output io.Writer) error {
 	if len(args) == 0 || args[0] != "analyze" {
-		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF> | investigate <sbom-file> --target <BOM-REF> --question <question>")
+		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF> | investigate <sbom-file> --target <BOM-REF> --question <question> [--model <tag>] [--ollama-url <url>]")
 	}
 
 	sbomPath, targetBOMRef, outputFormat, err := parseAnalyzeArgs(args[1:])
@@ -107,27 +107,27 @@ func runAnalyze(args []string, output io.Writer) error {
 }
 
 func runInvestigate(ctx context.Context, args []string, output io.Writer, factory investigatorFactory) error {
-	sbomPath, targetBOMRef, question, err := parseInvestigateArgs(args)
+	options, err := parseInvestigateArgs(args)
 	if err != nil {
 		return err
 	}
 
-	data, err := os.ReadFile(sbomPath)
+	data, err := os.ReadFile(options.sbomPath)
 	if err != nil {
-		return fmt.Errorf("read SBOM %q: %w", sbomPath, err)
+		return fmt.Errorf("read SBOM %q: %w", options.sbomPath, err)
 	}
 	document, err := sbom.Parse(data)
 	if err != nil {
-		return fmt.Errorf("parse SBOM %q: %w", sbomPath, err)
+		return fmt.Errorf("parse SBOM %q: %w", options.sbomPath, err)
 	}
 
 	dependencyGraph, err := graph.New(document)
 	if err != nil {
 		return fmt.Errorf("build dependency graph: %w", err)
 	}
-	analysisResult, err := analysis.Analyze(dependencyGraph, targetBOMRef)
+	analysisResult, err := analysis.Analyze(dependencyGraph, options.targetBOMRef)
 	if err != nil {
-		return fmt.Errorf("analyze target %q: %w", targetBOMRef, err)
+		return fmt.Errorf("analyze target %q: %w", options.targetBOMRef, err)
 	}
 	evidence, err := investigation.FromAnalysis(analysisResult)
 	if err != nil {
@@ -136,7 +136,7 @@ func runInvestigate(ctx context.Context, args []string, output io.Writer, factor
 	if factory == nil {
 		return errors.New("investigator factory is nil")
 	}
-	investigator, err := factory()
+	investigator, err := factory(options.ollama)
 	if err != nil {
 		return fmt.Errorf("create investigator: %w", err)
 	}
@@ -144,10 +144,10 @@ func runInvestigate(ctx context.Context, args []string, output io.Writer, factor
 		return errors.New("investigator factory returned nil")
 	}
 
-	request := investigation.Request{Question: question}
+	request := investigation.Request{Question: options.question}
 	result, err := investigator.Investigate(ctx, request, evidence)
 	if err != nil {
-		return fmt.Errorf("investigate target %q: %w", targetBOMRef, err)
+		return fmt.Errorf("investigate target %q: %w", options.targetBOMRef, err)
 	}
 	if err := result.Validate(evidence); err != nil {
 		return fmt.Errorf("validate investigation result: %w", err)
@@ -160,83 +160,130 @@ func runInvestigate(ctx context.Context, args []string, output io.Writer, factor
 	return nil
 }
 
-func defaultInvestigatorFactory() (investigation.Investigator, error) {
-	model, err := agent.NewOllamaModel(agent.OllamaConfig{
-		BaseURL: defaultOllamaBaseURL,
-		Model:   defaultOllamaModel,
-	})
+func defaultInvestigatorFactory(config agent.OllamaConfig) (investigation.Investigator, error) {
+	model, err := agent.NewOllamaModel(config)
 	if err != nil {
 		return nil, err
 	}
 	return agent.New(model)
 }
 
-func parseInvestigateArgs(args []string) (string, string, string, error) {
-	var sbomPath, targetBOMRef, question string
+type investigateOptions struct {
+	sbomPath     string
+	targetBOMRef string
+	question     string
+	ollama       agent.OllamaConfig
+}
+
+func parseInvestigateArgs(args []string) (investigateOptions, error) {
+	options := investigateOptions{ollama: agent.OllamaConfig{
+		BaseURL: defaultOllamaBaseURL,
+		Model:   defaultOllamaModel,
+	}}
 	targetProvided := false
 	questionProvided := false
+	modelProvided := false
+	ollamaURLProvided := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--target":
 			if targetProvided {
-				return "", "", "", errors.New("--target may only be specified once")
+				return investigateOptions{}, errors.New("--target may only be specified once")
 			}
 			if i+1 >= len(args) || args[i+1] == "" {
-				return "", "", "", errors.New("--target requires a BOM-REF")
+				return investigateOptions{}, errors.New("--target requires a BOM-REF")
 			}
-			targetBOMRef = args[i+1]
+			options.targetBOMRef = args[i+1]
 			targetProvided = true
 			i++
 		case strings.HasPrefix(arg, "--target="):
 			if targetProvided {
-				return "", "", "", errors.New("--target may only be specified once")
+				return investigateOptions{}, errors.New("--target may only be specified once")
 			}
-			targetBOMRef = strings.TrimPrefix(arg, "--target=")
-			if targetBOMRef == "" {
-				return "", "", "", errors.New("--target requires a BOM-REF")
+			options.targetBOMRef = strings.TrimPrefix(arg, "--target=")
+			if options.targetBOMRef == "" {
+				return investigateOptions{}, errors.New("--target requires a BOM-REF")
 			}
 			targetProvided = true
 		case arg == "--question":
 			if questionProvided {
-				return "", "", "", errors.New("--question may only be specified once")
+				return investigateOptions{}, errors.New("--question may only be specified once")
 			}
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return "", "", "", errors.New("--question requires a non-empty question")
+				return investigateOptions{}, errors.New("--question requires a non-empty question")
 			}
-			question = args[i+1]
+			options.question = args[i+1]
 			questionProvided = true
 			i++
 		case strings.HasPrefix(arg, "--question="):
 			if questionProvided {
-				return "", "", "", errors.New("--question may only be specified once")
+				return investigateOptions{}, errors.New("--question may only be specified once")
 			}
-			question = strings.TrimPrefix(arg, "--question=")
-			if strings.TrimSpace(question) == "" {
-				return "", "", "", errors.New("--question requires a non-empty question")
+			options.question = strings.TrimPrefix(arg, "--question=")
+			if strings.TrimSpace(options.question) == "" {
+				return investigateOptions{}, errors.New("--question requires a non-empty question")
 			}
 			questionProvided = true
-		case strings.HasPrefix(arg, "-"):
-			return "", "", "", fmt.Errorf("unknown option %q", arg)
-		default:
-			if sbomPath != "" {
-				return "", "", "", fmt.Errorf("unexpected argument %q", arg)
+		case arg == "--model":
+			if modelProvided {
+				return investigateOptions{}, errors.New("--model may only be specified once")
 			}
-			sbomPath = arg
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return investigateOptions{}, errors.New("--model requires a non-empty model name")
+			}
+			options.ollama.Model = strings.TrimSpace(args[i+1])
+			modelProvided = true
+			i++
+		case strings.HasPrefix(arg, "--model="):
+			if modelProvided {
+				return investigateOptions{}, errors.New("--model may only be specified once")
+			}
+			options.ollama.Model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
+			if options.ollama.Model == "" {
+				return investigateOptions{}, errors.New("--model requires a non-empty model name")
+			}
+			modelProvided = true
+		case arg == "--ollama-url":
+			if ollamaURLProvided {
+				return investigateOptions{}, errors.New("--ollama-url may only be specified once")
+			}
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return investigateOptions{}, errors.New("--ollama-url requires a non-empty URL")
+			}
+			options.ollama.BaseURL = strings.TrimSpace(args[i+1])
+			ollamaURLProvided = true
+			i++
+		case strings.HasPrefix(arg, "--ollama-url="):
+			if ollamaURLProvided {
+				return investigateOptions{}, errors.New("--ollama-url may only be specified once")
+			}
+			options.ollama.BaseURL = strings.TrimSpace(strings.TrimPrefix(arg, "--ollama-url="))
+			if options.ollama.BaseURL == "" {
+				return investigateOptions{}, errors.New("--ollama-url requires a non-empty URL")
+			}
+			ollamaURLProvided = true
+		case strings.HasPrefix(arg, "-"):
+			return investigateOptions{}, fmt.Errorf("unknown option %q", arg)
+		default:
+			if options.sbomPath != "" {
+				return investigateOptions{}, fmt.Errorf("unexpected argument %q", arg)
+			}
+			options.sbomPath = arg
 		}
 	}
 
-	if sbomPath == "" {
-		return "", "", "", errors.New("missing SBOM file path")
+	if options.sbomPath == "" {
+		return investigateOptions{}, errors.New("missing SBOM file path")
 	}
 	if !targetProvided {
-		return "", "", "", errors.New("missing required --target <BOM-REF>")
+		return investigateOptions{}, errors.New("missing required --target <BOM-REF>")
 	}
 	if !questionProvided {
-		return "", "", "", errors.New("missing required --question <question>")
+		return investigateOptions{}, errors.New("missing required --question <question>")
 	}
-	return sbomPath, targetBOMRef, question, nil
+	return options, nil
 }
 
 func formatInvestigationReport(request investigation.Request, target investigation.Component, result investigation.Result) string {

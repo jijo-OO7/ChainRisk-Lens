@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -68,8 +67,8 @@ type OllamaModel struct {
 	client   *http.Client
 }
 
-// NewOllamaModel creates an Ollama-backed model. The endpoint must use HTTP on
-// a loopback address; model installation and downloading are not performed.
+// NewOllamaModel creates an Ollama-backed model. Model installation and
+// downloading are not performed.
 func NewOllamaModel(config OllamaConfig) (*OllamaModel, error) {
 	baseURL := config.BaseURL
 	if baseURL == "" {
@@ -167,19 +166,11 @@ func ollamaChatEndpoint(baseURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse Ollama base URL: %w", err)
 	}
-	if parsed.Scheme != "http" || parsed.Opaque != "" || parsed.Host == "" {
-		return "", errors.New("Ollama base URL must be an http URL on a loopback address")
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Opaque != "" || parsed.Host == "" {
+		return "", errors.New("Ollama base URL must be an absolute http or https URL")
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 		return "", errors.New("Ollama base URL must not contain credentials, a path, query, or fragment")
-	}
-
-	host := parsed.Hostname()
-	if !strings.EqualFold(host, "localhost") {
-		address := net.ParseIP(host)
-		if address == nil || !address.IsLoopback() {
-			return "", errors.New("Ollama base URL must use a loopback address; remote endpoints are not allowed")
-		}
 	}
 
 	return strings.TrimRight(parsed.String(), "/") + "/api/chat", nil

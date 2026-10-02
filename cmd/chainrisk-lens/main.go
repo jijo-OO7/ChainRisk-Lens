@@ -38,6 +38,10 @@ func run(args []string, output io.Writer) error {
 	return runWithInvestigatorFactory(context.Background(), args, output, defaultInvestigatorFactory)
 }
 
+func defaultOllamaConfig() agent.OllamaConfig {
+	return agent.OllamaConfig{BaseURL: defaultOllamaBaseURL, Model: defaultOllamaModel}
+}
+
 type investigatorFactory func(agent.OllamaConfig) (investigation.Investigator, error)
 
 func execute(ctx context.Context, args []string, output, errorOutput io.Writer, factory investigatorFactory) error {
@@ -49,15 +53,24 @@ func execute(ctx context.Context, args []string, output, errorOutput io.Writer, 
 }
 
 func runWithInvestigatorFactory(ctx context.Context, args []string, output io.Writer, factory investigatorFactory) error {
-	if len(args) > 0 && args[0] == "investigate" {
-		return runInvestigate(ctx, args[1:], output, factory)
+	return runWithSetupDependencies(ctx, args, output, factory, defaultOllamaConfig(), defaultSetupProbes())
+}
+
+func runWithSetupDependencies(ctx context.Context, args []string, output io.Writer, factory investigatorFactory, config agent.OllamaConfig, probes setupProbes) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "setup":
+			return runSetup(args[1:], output, config, probes)
+		case "investigate":
+			return runInvestigate(ctx, args[1:], output, factory)
+		}
 	}
 	return runAnalyze(args, output)
 }
 
 func runAnalyze(args []string, output io.Writer) error {
 	if len(args) == 0 || args[0] != "analyze" {
-		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF> | investigate <sbom-file> --target <BOM-REF> --question <question> [--model <tag>] [--ollama-url <url>]")
+		return errors.New("usage: chainrisk-lens analyze <sbom-file> --target <BOM-REF> | investigate <sbom-file> --target <BOM-REF> --question <question> [--model <tag>] [--ollama-url <url>] | setup")
 	}
 
 	sbomPath, targetBOMRef, outputFormat, err := parseAnalyzeArgs(args[1:])
@@ -176,10 +189,7 @@ type investigateOptions struct {
 }
 
 func parseInvestigateArgs(args []string) (investigateOptions, error) {
-	options := investigateOptions{ollama: agent.OllamaConfig{
-		BaseURL: defaultOllamaBaseURL,
-		Model:   defaultOllamaModel,
-	}}
+	options := investigateOptions{ollama: defaultOllamaConfig()}
 	targetProvided := false
 	questionProvided := false
 	modelProvided := false

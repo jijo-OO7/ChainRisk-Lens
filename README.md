@@ -50,7 +50,7 @@ The analysis output is target-centric. The target is assumed compromised and has
 
 The parser intentionally extracts only the component and dependency fields used by this MVP; it is not a complete CycloneDX document-preservation or validation library.
 
-## Requirements
+## ------------------- Requirements-----------------------
 
 - **Go 1.25.0 or newer** to build or test from source.
 - A CycloneDX JSON SBOM with a `bomFormat` field set to `CycloneDX` for analysis and investigation.
